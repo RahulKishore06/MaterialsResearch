@@ -1,0 +1,141 @@
+# -------------------------------
+# Imports
+# -------------------------------
+from mp_api.client import MPRester
+from pymatgen.electronic_structure.core import Spin
+from pymatgen.electronic_structure.plotter import BSDOSPlotter
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# -------------------------------
+# API Access
+# -------------------------------
+mpr = MPRester()
+
+# -------------------------------
+# Material Selection
+# -------------------------------
+mid = "mp-149"  # Silicon
+bs = mpr.get_bandstructure_by_material_id(mid)
+dos = mpr.get_dos_by_material_id(mid)
+structure = mpr.get_structure_by_material_id(mid)
+
+print(f"--Structure:--\n{structure}")
+
+# -------------------------------
+# BSDOS Plot
+# -------------------------------
+bsp = BSDOSPlotter()
+ax_bs, ax_dos = bsp.get_plot(bs, dos)
+
+# -------------------------------
+# Tabulate DOS
+# -------------------------------
+energies = dos.energies - dos.efermi
+
+if Spin.down in dos.densities:
+    total_dos = dos.densities[Spin.up] + dos.densities[Spin.down]
+else:
+    total_dos = dos.densities[Spin.up]
+
+dos_df = pd.DataFrame({
+    "Energy (eV)": energies,
+    "Total DOS (states/eV)": total_dos
+})
+
+print("--DOS Table--")
+print(dos_df.head())
+
+# -------------------------------
+# Analyze Parallel Regions
+# -------------------------------
+
+def analyze_parallel_band_regions(bs, N=3, slope_tol=0.05):
+    """
+    Analyze parallel stretches between valence and conduction bands near the Fermi level.
+    Skips discontinuities at labeled k-points to avoid zero-division in gradients.
+    """
+    from pymatgen.electronic_structure.core import Spin
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    spin = Spin.up
+    bands = bs.bands[spin]
+    fermi_level = bs.efermi
+    kpoints = np.array(bs.distance)  # Fix: make kpoints a NumPy array!
+
+    # Shift bands by Ef
+    shifted_bands = [band - fermi_level for band in bands]
+
+    # Sort by distance from Ef
+    band_distance_map = {}
+    for idx, band in enumerate(bands):
+        min_distance = np.min(np.abs(band - fermi_level))
+        band_distance_map[idx] = min_distance
+
+    sorted_band_indices = sorted(band_distance_map, key=band_distance_map.get)
+
+    valence_bands = []
+    conduction_bands = []
+    for band_idx in sorted_band_indices:
+        mean_energy = np.mean(shifted_bands[band_idx])
+        if mean_energy < 0:
+            valence_bands.append(band_idx)
+        else:
+            conduction_bands.append(band_idx)
+
+    valence_bands_N = valence_bands[:N]
+    conduction_bands_N = conduction_bands[:N]
+
+    print(f"Selected valence bands: {valence_bands_N}")
+    print(f"Selected conduction bands: {conduction_bands_N}")
+
+    # Identify discontinuities using k-point labels
+    kp_labels = [kp.label for kp in bs.kpoints]
+    mask = np.array([label is None for label in kp_labels])
+
+    # Plot Ec - Ev
+    plt.figure(figsize=(10, 6))
+    for vb_idx in valence_bands_N:
+        for cb_idx in conduction_bands_N:
+            Ev = shifted_bands[vb_idx]
+            Ec = shifted_bands[cb_idx]
+            gap = Ec - Ev
+            plt.plot(kpoints, gap, label=f"Ec(B{cb_idx+1}) - Ev(B{vb_idx+1})")
+
+    plt.xlabel("k-point distance (1/Å)")
+    plt.ylabel("Energy Gap Ec - Ev (eV)")
+    plt.title(f"Possible Indirect Gaps (N={N})")
+    plt.legend()
+    plt.show()
+
+    # Plot gradients only on continuous parts
+    plt.figure(figsize=(10, 6))
+    for vb_idx in valence_bands_N:
+        for cb_idx in conduction_bands_N:
+            Ev = shifted_bands[vb_idx]
+            Ec = shifted_bands[cb_idx]
+            gap = Ec - Ev
+
+            k_masked = kpoints[mask]
+            gap_masked = gap[mask]
+
+            grad = np.gradient(gap_masked, k_masked)
+            plt.plot(k_masked, grad, label=f"d(Ec-B{cb_idx+1} - Ev-B{vb_idx+1})/dk")
+
+            flat = np.abs(grad) < slope_tol
+            plt.plot(k_masked[flat], grad[flat], 'o', markersize=3)
+
+    plt.xlabel("k-point distance (1/Å)")
+    plt.ylabel("Gradient of Ec - Ev (eV/1Å)")
+    plt.title(f"Gradient of Indirect Gaps | Tolerance: {slope_tol}")
+    plt.legend()
+    plt.show()
+
+    print("Parallel region analysis done!")
+
+# -------------------------------
+# Run the new analysis
+# -------------------------------
+analyze_parallel_band_regions(bs, N=3, slope_tol=0.05)
