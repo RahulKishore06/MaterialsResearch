@@ -51,91 +51,99 @@ print(dos_df.head())
 # Analyze Parallel Regions
 # -------------------------------
 
-def analyze_parallel_band_regions(bs, N=3, slope_tol=0.05):
+def analyze_direct_bandgap_singularities(bs, N=3, slope_tol=50.0):
     """
-    Analyze parallel stretches between valence and conduction bands near the Fermi level.
-    Skips discontinuities at labeled k-points to avoid zero-division in gradients.
+    Analyze direct band gaps and identify type 2 singularities
+    where gradient d(Ec - Ev)/dk exceeds slope_tol.
+    Only considers energy gaps in [E_gap, 5*E_gap] range.
+    Returns a DataFrame of k-point info.
     """
     from pymatgen.electronic_structure.core import Spin
     import numpy as np
+    import pandas as pd
     import matplotlib.pyplot as plt
 
     spin = Spin.up
     bands = bs.bands[spin]
-    fermi_level = bs.efermi
-    kpoints = np.array(bs.distance)  # Fix: make kpoints a NumPy array!
+    fermi = bs.efermi
+    kpoints = np.array(bs.distance)
 
-    # Shift bands by Ef
-    shifted_bands = [band - fermi_level for band in bands]
+    # Shift bands relative to Fermi level
+    shifted_bands = [band - fermi for band in bands]
 
-    # Sort by distance from Ef
-    band_distance_map = {}
-    for idx, band in enumerate(bands):
-        min_distance = np.min(np.abs(band - fermi_level))
-        band_distance_map[idx] = min_distance
+    # Identify valence (below Ef) and conduction (above Ef) bands
+    band_info = [(i, np.mean(b)) for i, b in enumerate(shifted_bands)]
+    valence_bands = sorted([i for i, e in band_info if e < 0], key=lambda i: abs(np.mean(shifted_bands[i])))[:N]
+    conduction_bands = sorted([i for i, e in band_info if e > 0], key=lambda i: abs(np.mean(shifted_bands[i])))[:N]
 
-    sorted_band_indices = sorted(band_distance_map, key=band_distance_map.get)
+    print(f"Valence bands: {valence_bands}")
+    print(f"Conduction bands: {conduction_bands}")
 
-    valence_bands = []
-    conduction_bands = []
-    for band_idx in sorted_band_indices:
-        mean_energy = np.mean(shifted_bands[band_idx])
-        if mean_energy < 0:
-            valence_bands.append(band_idx)
-        else:
-            conduction_bands.append(band_idx)
+    # Collect analysis results
+    records = []
 
-    valence_bands_N = valence_bands[:N]
-    conduction_bands_N = conduction_bands[:N]
-
-    print(f"Selected valence bands: {valence_bands_N}")
-    print(f"Selected conduction bands: {conduction_bands_N}")
-
-    # Identify discontinuities using k-point labels
-    kp_labels = [kp.label for kp in bs.kpoints]
-    mask = np.array([label is None for label in kp_labels])
-
-    # Plot Ec - Ev
     plt.figure(figsize=(10, 6))
-    for vb_idx in valence_bands_N:
-        for cb_idx in conduction_bands_N:
-            Ev = shifted_bands[vb_idx]
-            Ec = shifted_bands[cb_idx]
-            gap = Ec - Ev
-            plt.plot(kpoints, gap, label=f"Ec(B{cb_idx+1}) - Ev(B{vb_idx+1})")
+    min_gap_val = float("inf")
+    min_gap_idx = None
 
-    plt.xlabel("k-point distance (1/Å)")
-    plt.ylabel("Energy Gap Ec - Ev (eV)")
-    plt.title(f"Possible Indirect Gaps (N={N})")
-    plt.legend()
-    plt.show()
-
-    # Plot gradients only on continuous parts
-    plt.figure(figsize=(10, 6))
-    for vb_idx in valence_bands_N:
-        for cb_idx in conduction_bands_N:
-            Ev = shifted_bands[vb_idx]
-            Ec = shifted_bands[cb_idx]
+    for vb in valence_bands:
+        for cb in conduction_bands:
+            Ev = shifted_bands[vb]
+            Ec = shifted_bands[cb]
             gap = Ec - Ev
 
-            k_masked = kpoints[mask]
-            gap_masked = gap[mask]
+            # Skip bands that cross (metallic)
+            if np.any(gap <= 0):
+                continue
 
-            grad = np.gradient(gap_masked, k_masked)
-            plt.plot(k_masked, grad, label=f"d(Ec-B{cb_idx+1} - Ev-B{vb_idx+1})/dk")
+            Egap = np.min(gap)
+            max_range = 5 * Egap
+            in_range = (gap >= Egap) & (gap <= max_range)
 
-            flat = np.abs(grad) < slope_tol
-            plt.plot(k_masked[flat], grad[flat], 'o', markersize=3)
+            grad = np.gradient(gap, kpoints)
+            grad_magnitude = np.abs(grad)
+
+            for i in range(len(kpoints)):
+                if not in_range[i]:
+                    continue
+                records.append({
+                    "k-point (1/Å)": kpoints[i],
+                    "Ev (eV)": Ev[i],
+                    "Ec (eV)": Ec[i],
+                    "Ec - Ev (eV)": gap[i],
+                    "d(Ec - Ev)/dk (eV/Å)": grad[i],
+                    "Singular": grad_magnitude[i] > slope_tol
+                })
+
+            # Track minimum direct gap
+            local_min_idx = np.argmin(gap)
+            if gap[local_min_idx] < min_gap_val:
+                min_gap_val = gap[local_min_idx]
+                min_gap_idx = local_min_idx
+                min_gap_k = kpoints[local_min_idx]
+                min_gap_label = f"B{cb+1}-B{vb+1}"
+
+            # Plot gradients and mark singularities
+            plt.plot(kpoints, grad, label=f"{cb+1}-{vb+1}")
+            singular_pts = grad_magnitude > slope_tol
+            plt.plot(kpoints[singular_pts], grad[singular_pts], 'rx', markersize=4)
+
+    # Highlight minimum gap point
+    if min_gap_idx is not None:
+        plt.axvline(kpoints[min_gap_idx], color='k', linestyle='--', label="Min Gap")
+        print(f"Minimum direct gap: {min_gap_val:.3f} eV at k = {kpoints[min_gap_idx]:.3f} (Band {min_gap_label})")
 
     plt.xlabel("k-point distance (1/Å)")
-    plt.ylabel("Gradient of Ec - Ev (eV/1Å)")
-    plt.title(f"Gradient of Indirect Gaps | Tolerance: {slope_tol}")
+    plt.ylabel("d(Ec - Ev)/dk (eV/Å)")
+    plt.title(f"Gradient of Direct Gaps | Tolerance: {slope_tol} eV/Å")
     plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
     plt.show()
 
-    print("Parallel region analysis done!")
+    # Return DataFrame
+    df = pd.DataFrame(records)
+    return df
 
-# -------------------------------
-# Run the new analysis
-# -------------------------------
-analyze_parallel_band_regions(bs, N=3, slope_tol=0.05)
+#Adjustable number of analyzed bands and slope tolerance
+df = analyze_direct_bandgap_singularities(bs, N=4, slope_tol=5)
